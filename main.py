@@ -27,7 +27,6 @@ import pathlib
 import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Any
-from collections import Counter
 
 import faiss
 import numpy as np
@@ -176,19 +175,11 @@ for batch_text in tqdm(batched(row_iter, cfg.batch_size),
                 s0, s1 = max(0, ti - 5), min(acts.shape[1], ti + 6)
                 ctx = tok.decode(toks.input_ids[bi, s0:s1])
                 for latent, val in zip(idxs[bi, ti], vals[bi, ti]):
-                    if val <= 0:
-                        continue
+                    if val <= 0: continue
                     fkey = f"{hook}/{latent.item()}"
-                    item = meta.setdefault(
-                        fkey,
-                        {"tokens": [], "context_ids": [], "contexts": [], "_ctx_map": {}, "strengths": []},
-                    )
-                    # ensure context is stored once and tokens reference it by index
-                    if ctx not in item["_ctx_map"]:
-                        item["_ctx_map"][ctx] = len(item["contexts"])
-                        item["contexts"].append(ctx)
+                    item = meta.setdefault(fkey, {"tokens": [], "contexts": [], "strengths": []})
                     item["tokens"].append(tok_str)
-                    item["context_ids"].append(item["_ctx_map"][ctx])
+                    item["contexts"].append(ctx)
                     item["strengths"].append(float(val))
 
 # ─────────────────── LABEL & TEXT INDEX ───────────────────────── #
@@ -198,13 +189,9 @@ labels = []
 for fk in tqdm(all_feats):
     entry = meta[fk]
     toks = entry["tokens"][:cfg.examples_per_feat]
-    # figure out most common contexts referenced by tokens
-    ctx_counts = Counter(entry["context_ids"])
-    top_ctx_ids = [ci for ci, _ in ctx_counts.most_common(cfg.examples_per_feat)]
-    ctxs = [entry["contexts"][ci] for ci in top_ctx_ids]
+    ctxs = entry["contexts"][:cfg.examples_per_feat]
     lbl, desc = label_feature(toks, ctxs)
     entry["label"], entry["description"] = lbl, desc
-    entry.pop("_ctx_map", None)
     labels.append(lbl)
 
 print("Building label-text FAISS index …")
