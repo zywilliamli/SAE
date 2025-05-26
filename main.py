@@ -51,7 +51,7 @@ class Config:
     n_rows: int = 10  # dataset rows to scan
     max_len: int = 512
     batch_size: int = 8
-    layers: Sequence[int] | None = None  # None → all SAEs; else set a list after initialising config
+    layers: Sequence[str] | None = None  # None → all SAEs; else set a list after initialising config
     topk_per_token: int = 5
     examples_per_feat: int = 20
     # steering
@@ -66,7 +66,7 @@ class Config:
 
 
 cfg = Config()
-cfg.layers = [10]
+cfg.layers = ["layers.10"]
 cfg.workdir.mkdir(exist_ok=True)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -92,8 +92,7 @@ saes_raw: Dict[str, Any] = Sae.load_many(cfg.sae_repo)  # returns Sae or SparseC
 
 # keep only specific layers if configured
 if cfg.layers is not None:
-    saes_raw = {k: v for k, v in saes_raw.items()
-                if k.startswith("layers.") and int(k.split(".")[1]) in cfg.layers}
+    saes_raw = {k: v for k, v in saes_raw.items() if k in cfg.layers}
 
 first_sae = next(iter(saes_raw.values()))
 W_dec0 = first_sae.W_dec
@@ -139,7 +138,7 @@ def label_feature(tokens: List[str], contexts: List[str]) -> tuple[str, str]:
             label = line.split(":", 1)[1].strip()
         elif line.strip().startswith("DESCRIPTION:"):
             descr = line.split(":", 1)[1].strip()
-    return (label or "Unlabelled", descr or "–")
+    return label or "Unlabelled", descr or "–"
 
 
 # ───────────────────────── DISCOVERY ──────────────────────────── #
@@ -168,7 +167,8 @@ for batch_text in tqdm(batched(row_iter, cfg.batch_size),
 
         for bi in range(acts.shape[0]):
             for ti in range(acts.shape[1]):
-                if toks.attention_mask[bi, ti] == 0: continue
+                if toks.attention_mask[bi, ti] == 0:
+                    continue
                 tok_id = toks.input_ids[bi, ti].item()
                 tok_str = tok.decode([tok_id])
                 # 5-token context
@@ -278,7 +278,8 @@ def steer(feature_key: str, strength: float | None = None, mode: str = "bias"):
     try:
         yield
     finally:
-        for h in handles: h.remove()
+        for h in handles:
+            h.remove()
 
 
 def generate(prompt: str, feature_key: str | None = None, strength: float | None = None,
@@ -294,11 +295,10 @@ def generate(prompt: str, feature_key: str | None = None, strength: float | None
 # ────────────────────────── DEMO ─────────────────────────────── #
 if __name__ == "__main__":
     term = "mathematics"
-    print(f"\nTop semantic features for '{term}':")
+    print(f"Top semantic features for '{term}':")
     for r in search_by_text(term, 3):
         print(f"· {r['label']}: {r['description'][:60]}…")
 
     chosen = search_by_text(term, 1)[0]["feature"]
-    print(f"\nGenerating with feature {chosen} boosted (latent mode):\n")
-    print(generate("The scientist discovered", feature_key=chosen,
-                   strength=8.0, mode="latent"))
+    print(f"Generating with feature {chosen} boosted (latent mode):")
+    print(generate("The scientist discovered", feature_key=chosen, strength=8.0, mode="latent"))
