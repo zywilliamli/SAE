@@ -1,0 +1,8 @@
+torch
+faiss-cpu
+tqdm
+numpy
+transformers
+datasets
+openai
+eai-sparsify
