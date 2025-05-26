@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-sae_feature_pipeline.py  –  robust to both *Sae* (new API) and *SparseCoder* (legacy)
 Author: William Li   •   2025-05-25
 
 ▪ Discovers + labels sparse-autoencoder features for EleutherAI/pythia-160m
@@ -13,8 +12,7 @@ Author: William Li   •   2025-05-25
 
 To install deps:
 
-    pip install "transformers>=4.40" "datasets>=2.19" faiss-cpu \
-                sparsify openai tqdm
+    pip install -m requirements.txt
 
 and set:
 
@@ -37,22 +35,23 @@ import torch
 from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from sparsify import Sae
 
 
 # ───────────────────────────── CONFIG ───────────────────────────── #
 @dataclass
 class Config:
-    # models
+    # model
     lm_name: str = "EleutherAI/pythia-160m"
     sae_repo: str = "EleutherAI/sae-pythia-160m-32k"
     embed_model: str = "text-embedding-3-small"
-    gpt_label_model: str = "gpt-4o-mini"
-    # data
+    gpt_label_model: str = "gpt-4.1-nano-2025-04-14"
+    # dataset
     dataset: str = "neelnanda/pile-10k"
-    n_rows: int = 50  # dataset rows to scan
+    n_rows: int = 10  # dataset rows to scan
     max_len: int = 512
     batch_size: int = 8
-    layers: Sequence[int] | None = None  # None → all SAEs; else list, e.g. [5]
+    layers: Sequence[int] | None = None  # None → all SAEs; else set a list after initialising config
     topk_per_token: int = 5
     examples_per_feat: int = 20
     # steering
@@ -69,11 +68,12 @@ class Config:
 cfg = Config()
 cfg.layers = [10]
 cfg.workdir.mkdir(exist_ok=True)
-os.environ["KMP_DUPLICATE_LIB_OK"] = "True"  # suppress libomp clash
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # silence HF fork warning
-faiss.omp_set_num_threads(1)  # optional: single-thread FAISS
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+faiss.omp_set_num_threads(1)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 assert openai.api_key, "Set OPENAI_API_KEY in your environment!"
 
 # ────────────────────────── LOAD MODELS ────────────────────────── #
@@ -87,7 +87,6 @@ lm = AutoModelForCausalLM.from_pretrained(
 ).eval()
 
 print("Loading SAEs …")
-from sparsify import Sae  # both classes may appear
 
 saes_raw: Dict[str, Any] = Sae.load_many(cfg.sae_repo)  # returns Sae or SparseCoder
 
@@ -96,40 +95,8 @@ if cfg.layers is not None:
     saes_raw = {k: v for k, v in saes_raw.items()
                 if k.startswith("layers.") and int(k.split(".")[1]) in cfg.layers}
 
-
-# ───────── util: unified access to decoder weight & dims ───────── #
-def decoder_weight(sae_obj):
-    """
-    Return decoder weight matrix (latent_dim, d_model) as a detached CPU tensor.
-    Works for both new Sae and legacy SparseCoder checkpoints.
-    """
-    if hasattr(sae_obj, "decoder"):  # new API
-        return sae_obj.decoder.weight.detach().cpu()
-    for field in ("W_dec", "W_decoder", "reconstruction_weight"):
-        if hasattr(sae_obj, field):  # legacy API
-            return getattr(sae_obj, field).detach().cpu()
-    raise AttributeError("Decoder weight matrix not found")
-
-
-def latent_acts(output):
-    """
-    Return the latent-activation tensor no matter what the SAE/SparseCoder
-    gives back – plain Tensor, EncoderOutput, or a tuple.
-    Expected final shape: (batch, seq, latent_dim)
-    """
-    if isinstance(output, torch.Tensor):
-        return output
-    # EncoderOutput dataclass (newer *sparsify*)
-    if hasattr(output, "sae_acts"):
-        return output.sae_acts
-    # legacy (acts, recon) tuple
-    if isinstance(output, (list, tuple)) and isinstance(output[0], torch.Tensor):
-        return output[0]
-    raise TypeError("Unrecognised SAE encode output type")
-
-
 first_sae = next(iter(saes_raw.values()))
-W_dec0 = decoder_weight(first_sae)
+W_dec0 = first_sae.W_dec
 latent_dim, d_model = W_dec0.shape
 print(f"Using {len(saes_raw)} hookpoints × {latent_dim} latents each")
 
@@ -143,9 +110,10 @@ def batched(it, size):
     for x in it:
         buf.append(x)
         if len(buf) == size:
-            yield buf;
+            yield buf
             buf = []
-    if buf: yield buf
+    if buf:
+        yield buf
 
 
 def embed_text(texts: List[str]) -> np.ndarray:
@@ -194,7 +162,7 @@ for batch_text in tqdm(batched(row_iter, cfg.batch_size),
             h_state = outs.hidden_states[0]  # embedding stream
 
         # encode → activations
-        acts = latent_acts(sae.encode(h_state))  # (b, s, latent_dim)
+        acts = sae.encode(h_state)[0]
         topk = min(cfg.topk_per_token, latent_dim)
         vals, idxs = torch.topk(acts, topk, dim=-1)  # (b,s,k)
 
@@ -237,7 +205,7 @@ vec_mat = np.zeros((len(all_feats), d_model), dtype="float32")
 for i, fk in enumerate(all_feats):
     h, l = fk.split("/")
     l = int(l)
-    vec_mat[i] = decoder_weight(saes_raw[h])[l].numpy()
+    vec_mat[i] = saes_raw[h].W_dec[l].detach().cpu().numpy()
 vec_index.add(vec_mat)
 
 # ───────────────────── SAVE ARTIFACTS ─────────────────────────── #
@@ -277,7 +245,7 @@ def bias_hook(basis: torch.Tensor, strength: float):
 
 
 def latent_hook(sae_obj, latent: int, strength: float):
-    W_dec = decoder_weight(sae_obj).to(cfg.device)  # (L,d)
+    W_dec = sae_obj.W_dec.to(cfg.device)  # (L,d)
 
     def fn(_mod, _inp, output):
         acts = sae_obj.encode(output)  # (b,s,L)
@@ -298,7 +266,7 @@ def steer(feature_key: str, strength: float | None = None, mode: str = "bias"):
     handles = []
     basis = None
     if mode == "bias":
-        basis = decoder_weight(sae_obj)[latent].to(cfg.device)
+        basis = sae_obj.W_dec[latent].to(cfg.device)
 
     for name, module in lm.named_modules():
         if name == hook:
